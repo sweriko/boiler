@@ -124,6 +124,7 @@ async function init() {
 
     // --- Render ---
     renderer.renderAsync(scene, camera).then(() => {
+      renderer.resolveTimestampsAsync("compute");
       renderer.resolveTimestampsAsync("render");
     });
 
