@@ -2,7 +2,6 @@ import "./style.css";
 
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import WebGPU from "three/addons/capabilities/WebGPU.js";
 import Stats from "stats-gl";
 import { Pane } from "tweakpane";
 
@@ -142,10 +141,6 @@ class BoilerplateApp {
     description.textContent = error instanceof Error ? error.message : "Unknown initialization error.";
 
     errorCard.append(title, description);
-
-    if (!WebGPU.isAvailable()) {
-      errorCard.append(WebGPU.getErrorMessage());
-    }
 
     this.container.replaceChildren(errorCard);
   }
