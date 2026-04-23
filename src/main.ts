@@ -1,145 +1,279 @@
 import "./style.css";
 
 import * as THREE from "three/webgpu";
-import { Timer } from "three/addons/misc/Timer.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import WebGPU from "three/addons/capabilities/WebGPU.js";
 import Stats from "stats-gl";
 import { Pane } from "tweakpane";
 
-// ============================================================================
-// Scene setup
-// ============================================================================
+const BACKGROUND_COLOR = 0x070b14;
+const MAX_PIXEL_RATIO = 2;
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
-
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-camera.position.set(2, 2, 4);
-
-const renderer = new THREE.WebGPURenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
-document.body.appendChild(renderer.domElement);
-
-// ============================================================================
-// Stats (CPU, GPU, draw calls, triangles)
-// ============================================================================
-
-const stats = new Stats({ trackGPU: true });
-stats.init(renderer);
-document.body.appendChild(stats.dom);
-
-const triPanel = stats.addPanel(new Stats.Panel("TRIS", "#0ff", "#022"));
-const callPanel = stats.addPanel(new Stats.Panel("CALLS", "#f80", "#220"));
-let maxTris = 1;
-let maxCalls = 1;
-
-// ============================================================================
-// Main init
-// ============================================================================
-
-async function init() {
-  await renderer.init();
-
-  // --- Lighting (calibrated for ACES tone mapping) ---
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
-  scene.add(ambientLight);
-
-  const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
-  dirLight.position.set(5, 10, 5);
-  scene.add(dirLight);
-
-  // --- Ground ---
-  const groundMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(50, 50, 2, 2),
-    new THREE.MeshStandardNodeMaterial({ color: 0x333333, roughness: 0.8 }),
-  );
-  groundMesh.rotateX(-Math.PI / 2);
-  groundMesh.receiveShadow = true;
-  scene.add(groundMesh);
-  scene.add(new THREE.GridHelper(50, 50, 0x444444, 0x222222));
-
-  // --- Demo object ---
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(1, 1, 1),
-    new THREE.MeshStandardNodeMaterial({ color: 0xff6600, roughness: 0.4, metalness: 0.3 }),
-  );
-  mesh.position.y = 0.5;
-  scene.add(mesh);
-
-  // --- Orbit controls ---
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.target.set(0, 0.5, 0);
-
-  // ============================================================================
-  // Tweakpane
-  // ============================================================================
-
-  const params = {
-    rotationSpeed: 1.0,
-    exposure: 1.0,
-    ambientIntensity: 0.8,
-    directionalIntensity: 2.0,
+class BoilerplateApp {
+  private readonly container: HTMLElement;
+  private readonly scene = new THREE.Scene();
+  private readonly camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  private readonly renderer = new THREE.WebGPURenderer({
+    alpha: false,
+    antialias: true,
+    outputBufferType: THREE.HalfFloatType,
+    trackTimestamp: true,
+  });
+  private readonly controls: OrbitControls;
+  private readonly timer = new THREE.Timer();
+  private readonly paneHost: HTMLDivElement;
+  private readonly pane: Pane;
+  private readonly stats = new Stats({ trackGPU: true });
+  private readonly ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
+  private readonly keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
+  private readonly trackedMaterials = new Set<THREE.Material>();
+  private readonly trackedGeometries = new Set<THREE.BufferGeometry>();
+  private readonly cube: THREE.Mesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  private readonly triPanel: InstanceType<typeof Stats.Panel>;
+  private readonly drawCallPanel: InstanceType<typeof Stats.Panel>;
+  private timestampQueriesSupported = false;
+  private maxTriangles = 1;
+  private maxDrawCalls = 1;
+  private readonly params = {
+    ambient: 0.55,
+    autoRotate: false,
+    dpr: Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO),
+    exposure: 1,
+    key: 2.4,
+    rotationSpeed: 0.65,
   };
 
-  const pane = new Pane({ title: "Controls" });
+  constructor(container: HTMLElement) {
+    this.container = container;
 
-  const sceneFolder = pane.addFolder({ title: "Scene" });
-  sceneFolder.addBinding(params, "exposure", { min: 0.1, max: 3.0, step: 0.05 }).on("change", (ev) => {
-    renderer.toneMappingExposure = ev.value;
-  });
-  sceneFolder.addBinding(params, "ambientIntensity", { label: "Ambient", min: 0, max: 3, step: 0.1 }).on("change", (ev) => {
-    ambientLight.intensity = ev.value;
-  });
-  sceneFolder.addBinding(params, "directionalIntensity", { label: "Directional", min: 0, max: 5, step: 0.1 }).on("change", (ev) => {
-    dirLight.intensity = ev.value;
-  });
-
-  const objectFolder = pane.addFolder({ title: "Object" });
-  objectFolder.addBinding(params, "rotationSpeed", { label: "Rotation Speed", min: 0, max: 5, step: 0.1 });
-
-  // --- Resize ---
-  window.addEventListener("resize", () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-  });
-
-  // ============================================================================
-  // Main loop
-  // ============================================================================
-
-  const timer = new Timer();
-
-  function animate(): void {
-    timer.update();
-    const dt = Math.min(timer.getDelta(), 0.05); // cap to prevent spiral death
-
-    // --- Update ---
-    mesh.rotation.y += params.rotationSpeed * dt;
-    controls.update();
-
-    // --- Render ---
-    renderer.renderAsync(scene, camera).then(() => {
-      renderer.resolveTimestampsAsync("compute");
-      renderer.resolveTimestampsAsync("render");
+    this.paneHost = document.createElement("div");
+    this.paneHost.className = "ui-pane";
+    this.pane = new Pane({
+      container: this.paneHost,
+      title: "Controls",
     });
+    this.stats.dom.classList.add("ui-stats");
+    this.triPanel = this.stats.addPanel(new Stats.Panel("TRIS", "#84fff7", "#08262d"));
+    this.drawCallPanel = this.stats.addPanel(new Stats.Panel("CALLS", "#ffc171", "#34210b"));
 
-    const { triangles, drawCalls } = renderer.info.render;
-    maxTris = Math.max(maxTris, triangles);
-    maxCalls = Math.max(maxCalls, drawCalls);
-    triPanel.update(triangles, maxTris * 1.2, 0);
-    triPanel.updateGraph(triangles, maxTris * 1.2);
-    callPanel.update(drawCalls, maxCalls * 1.2, 0);
-    callPanel.updateGraph(drawCalls, maxCalls * 1.2);
+    this.renderer.domElement.className = "app__canvas";
+    this.container.append(this.renderer.domElement, this.stats.dom, this.paneHost);
 
-    stats.update();
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = this.params.exposure;
+
+    this.camera.position.set(3.2, 2.2, 4.6);
+
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.enablePan = true;
+    this.controls.autoRotate = this.params.autoRotate;
+    this.controls.autoRotateSpeed = 1;
+    this.controls.target.set(0, 0, 0);
+
+    this.timer.connect(document);
+
+    this.cube = new THREE.Mesh(
+      this.trackGeometry(new THREE.BoxGeometry(1, 1, 1)),
+      this.trackMaterial(
+        new THREE.MeshStandardMaterial({
+          color: 0xff6c43,
+          metalness: 0.08,
+          roughness: 0.58,
+        }),
+      ),
+    );
+
+    this.setupScene();
+    this.setupPane();
   }
 
-  renderer.setAnimationLoop(animate);
+  async init(): Promise<void> {
+    await this.renderer.init();
+    await this.stats.init(this.renderer);
+    this.timestampQueriesSupported = this.renderer.hasFeature("timestamp-query");
+
+    this.handleResize();
+    await this.renderer.compileAsync(this.scene, this.camera);
+
+    this.renderer.render(this.scene, this.camera);
+    this.flushRenderTimestamps();
+    this.updatePerformancePanels();
+    this.stats.update();
+
+    window.addEventListener("resize", this.handleResize, { passive: true });
+    this.renderer.setAnimationLoop(this.animate);
+  }
+
+  dispose(): void {
+    window.removeEventListener("resize", this.handleResize);
+    this.renderer.setAnimationLoop(null);
+
+    this.timer.dispose();
+    this.controls.dispose();
+    this.pane.dispose();
+    this.stats.dispose();
+
+    for (const geometry of this.trackedGeometries) {
+      geometry.dispose();
+    }
+
+    for (const material of this.trackedMaterials) {
+      material.dispose();
+    }
+
+    this.renderer.dispose();
+    this.container.replaceChildren();
+  }
+
+  showFatalError(error: unknown): void {
+    this.renderer.setAnimationLoop(null);
+
+    const errorCard = document.createElement("section");
+    errorCard.className = "error-card";
+
+    const title = document.createElement("span");
+    title.className = "error-card__title";
+    title.textContent = "Renderer initialization failed";
+
+    const description = document.createElement("p");
+    description.className = "error-card__meta";
+    description.textContent = error instanceof Error ? error.message : "Unknown initialization error.";
+
+    errorCard.append(title, description);
+
+    if (!WebGPU.isAvailable()) {
+      errorCard.append(WebGPU.getErrorMessage());
+    }
+
+    this.container.replaceChildren(errorCard);
+  }
+
+  private setupScene(): void {
+    this.scene.background = new THREE.Color(BACKGROUND_COLOR);
+
+    this.keyLight.position.set(3, 4, 2);
+
+    this.scene.add(this.ambientLight, this.keyLight, this.cube);
+  }
+
+  private setupPane(): void {
+    this.pane.addBinding(this.params, "rotationSpeed", {
+      label: "Spin",
+      min: 0,
+      max: 2,
+      step: 0.01,
+    });
+    this.pane.addBinding(this.params, "exposure", {
+      min: 0.5,
+      max: 2,
+      step: 0.05,
+    }).on("change", ({ value }) => {
+      this.renderer.toneMappingExposure = value;
+    });
+    this.pane.addBinding(this.params, "ambient", {
+      min: 0,
+      max: 2,
+      step: 0.05,
+    }).on("change", ({ value }) => {
+      this.ambientLight.intensity = value;
+    });
+    this.pane.addBinding(this.params, "key", {
+      min: 0,
+      max: 6,
+      step: 0.1,
+    }).on("change", ({ value }) => {
+      this.keyLight.intensity = value;
+    });
+    this.pane.addBinding(this.params, "autoRotate", {
+      label: "Camera",
+    }).on("change", ({ value }) => {
+      this.controls.autoRotate = value;
+    });
+    this.pane.addBinding(this.params, "dpr", {
+      min: 0.5,
+      max: MAX_PIXEL_RATIO,
+      step: 0.1,
+    }).on("change", () => {
+      this.handleResize();
+    });
+  }
+
+  private readonly handleResize = (): void => {
+    const width = this.container.clientWidth || window.innerWidth;
+    const height = this.container.clientHeight || window.innerHeight;
+
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.params.dpr));
+    this.renderer.setSize(width, height);
+  };
+
+  private readonly animate = (timestamp?: number): void => {
+    this.timer.update(timestamp);
+
+    const delta = this.timer.getDelta();
+    const rotationStep = delta * this.params.rotationSpeed;
+
+    this.cube.rotation.x += rotationStep * 0.45;
+    this.cube.rotation.y += rotationStep;
+
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+    this.flushRenderTimestamps();
+    this.updatePerformancePanels();
+    this.stats.update();
+  };
+
+  private flushRenderTimestamps(): void {
+    if (!this.timestampQueriesSupported) {
+      return;
+    }
+
+    void this.renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER);
+  }
+
+  private updatePerformancePanels(): void {
+    const { drawCalls, triangles } = this.renderer.info.render;
+
+    this.maxTriangles = Math.max(this.maxTriangles, triangles, 1);
+    this.maxDrawCalls = Math.max(this.maxDrawCalls, drawCalls, 1);
+
+    this.triPanel.update(triangles, this.maxTriangles * 1.15, 0);
+    this.triPanel.updateGraph(triangles, this.maxTriangles * 1.15);
+
+    this.drawCallPanel.update(drawCalls, this.maxDrawCalls * 1.15, 0);
+    this.drawCallPanel.updateGraph(drawCalls, this.maxDrawCalls * 1.15);
+  }
+
+  private trackGeometry<T extends THREE.BufferGeometry>(geometry: T): T {
+    this.trackedGeometries.add(geometry);
+    return geometry;
+  }
+
+  private trackMaterial<T extends THREE.Material>(material: T): T {
+    this.trackedMaterials.add(material);
+    return material;
+  }
 }
 
-init().catch(console.error);
+const appElement = document.querySelector<HTMLElement>("#app");
+
+if (!appElement) {
+  throw new Error("App root #app was not found.");
+}
+
+const app = new BoilerplateApp(appElement);
+
+app.init().catch((error) => {
+  console.error(error);
+  app.showFatalError(error);
+});
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    app.dispose();
+  });
+}
